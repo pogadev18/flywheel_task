@@ -82,3 +82,18 @@ attempts in the run log). In exchange each request is bounded and the UI can rep
 between attempts instead of hanging for 30+ seconds.
 
 ---
+## Verified live run (after the fix in entry 3)
+
+Driving the real production endpoint the same way the browser does — half marathon,
+6 weeks, 30 km/week, 5 days available:
+
+```
+attempt 1: valid=False failed=['volume_ramp', 'long_session_share'] viol=2 in=446  out=457 lat=8.9s  cost=$0.0082
+attempt 2: valid=True  failed=[]                                    viol=0 in=1084 out=895 lat=12.9s cost=$0.0167
+converged at attempt 2
+```
+
+That is the pipeline doing its job: the first plan ramped volume too fast and put too much
+of a week into one session, the deterministic validator caught both without a model call,
+and one repair round fixed them. Input tokens grow from 446 to 1084 on the repair because
+the prior plan and the structured violations are fed back as context.
