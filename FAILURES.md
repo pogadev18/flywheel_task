@@ -45,3 +45,40 @@ directory that runs `validatePlan` against synthetic plans (this is what surface
 The model-dependent path was verified against the live production URL after deploy.
 
 ---
+## 3. Live `POST /api/plan` returned HTTP 502 after 31 seconds
+
+**What broke.** The first end-to-end call against production failed:
+`{"errorType":"Error","errorMessage":"An unknown error has occurred"}` after 31.0s.
+Locally the build was clean and the route typechecked.
+
+**What I thought it was.** The generic Netlify error body reads like a crash inside the
+handler, so my first guess was an unhandled exception in the SDK path — a bad `model` id, or
+the `messages.create` call throwing something my `catch` didn't cover.
+
+**What it actually was.** A timeout, not a crash. Netlify caps a synchronous function at
+about 26 seconds; the request died at 31s wall clock. The route was doing up to three
+sequential `messages.create` calls (generate + 2 repairs) inside a single HTTP request, and
+even one generation of a 6-week × 7-day plan with prose notes is roughly 1,300 output tokens
+— on its own that is already 15–25s. Three of them never had a chance. The generic error
+body is what Netlify substitutes for a killed function, which is why it looked like a crash.
+
+**What I changed.** Two things.
+
+1. **Moved the loop to the client.** `POST /api/plan` now performs exactly ONE model call
+   per request and returns that attempt plus its validation report and the model's raw
+   reply. The browser drives generate → validate → repair, feeding the previous raw reply and
+   the structured violations into the next request. The 3-attempt ceiling is enforced on both
+   sides (`MAX_ATTEMPTS` in the client, and a `400` for `attempt > 3` in the route), so the
+   loop still cannot run unbounded. The API key never leaves the server.
+2. **Compacted the model's wire format.** The model now emits
+   `{"w":[[["easy",8,"steady aerobic"], ...]]}` — positional arrays, minified, notes capped
+   at 6 words — which the server expands into the documented `weeks[].days[]` shape. That is
+   roughly half the output tokens, which pulls a single attempt well inside the ceiling.
+   The public API response shape is unchanged.
+
+The tradeoff: a user watching the network tab sees up to three requests instead of one, and
+each repair re-sends the prior plan as context (which is why input tokens climb across
+attempts in the run log). In exchange each request is bounded and the UI can report progress
+between attempts instead of hanging for 30+ seconds.
+
+---

@@ -2,7 +2,9 @@
 
 import { useState } from "react";
 
-import type { PlanResponse, SessionType } from "@/lib/types";
+import type { AttemptLog, AttemptResponse, Plan, SessionType, ValidationReport } from "@/lib/types";
+
+const MAX_ATTEMPTS = 3; // 1 generate + up to 2 repairs. Also enforced server-side.
 
 const TYPE_COLORS: Record<SessionType, string> = {
   easy: "#dcfce7",
@@ -24,33 +26,82 @@ export default function Home() {
   const [experience, setExperience] = useState("Recreational, 2 years of running");
 
   const [loading, setLoading] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [data, setData] = useState<PlanResponse | null>(null);
+  const [plan, setPlan] = useState<Plan | null>(null);
+  const [validation, setValidation] = useState<ValidationReport | null>(null);
+  const [attempts, setAttempts] = useState<AttemptLog[]>([]);
+  const [valid, setValid] = useState(false);
 
+  // The repair loop lives here, not in the route handler: one model call per
+  // request keeps each request under Netlify's ~26s function ceiling.
   async function generate(e: React.FormEvent) {
     e.preventDefault();
     setLoading(true);
     setError(null);
-    setData(null);
+    setPlan(null);
+    setValidation(null);
+    setAttempts([]);
+    setValid(false);
+
+    const log: AttemptLog[] = [];
+    let previousRaw: string | undefined;
+    let lastViolations: ValidationReport["violations"] | undefined;
+    let lastParseError: string | undefined;
+
     try {
-      const res = await fetch("/api/plan", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ goal, weeks, currentWeeklyKm, daysAvailable, experience }),
-      });
-      const body = (await res.json()) as PlanResponse;
-      if (!res.ok || !body.ok) {
-        setError(body.error ?? `HTTP ${res.status}`);
-        setData(body.attempts?.length ? body : null);
-        return;
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        setStatus(attempt === 1 ? "Generating plan..." : `Validation failed. Repair attempt ${attempt - 1} of ${MAX_ATTEMPTS - 1}...`);
+
+        const res = await fetch("/api/plan", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            goal,
+            weeks,
+            currentWeeklyKm,
+            daysAvailable,
+            experience,
+            attempt,
+            previousRaw,
+            violations: lastViolations,
+            parseError: lastParseError,
+          }),
+        });
+
+        const body = (await res.json()) as AttemptResponse;
+        if (!res.ok || !body.ok) {
+          setError(body.error ?? `HTTP ${res.status}`);
+          break;
+        }
+
+        log.push(body.attempt);
+        setAttempts([...log]);
+        if (body.plan) setPlan(body.plan);
+        if (body.validation) setValidation(body.validation);
+        setValid(body.valid);
+
+        if (body.valid) break;
+
+        previousRaw = body.raw;
+        lastViolations = body.validation?.violations;
+        lastParseError = body.attempt.parseError ?? undefined;
       }
-      setData(body);
     } catch (err) {
       setError(String(err));
     } finally {
+      setStatus(null);
       setLoading(false);
     }
   }
+
+  const totals = {
+    attempts: attempts.length,
+    inputTokens: attempts.reduce((s, a) => s + a.inputTokens, 0),
+    outputTokens: attempts.reduce((s, a) => s + a.outputTokens, 0),
+    latencyMs: attempts.reduce((s, a) => s + a.latencyMs, 0),
+    costUsd: attempts.reduce((s, a) => s + a.costUsd, 0),
+  };
 
   return (
     <main style={{ fontFamily: "system-ui, sans-serif", padding: 24, maxWidth: 1100, margin: "0 auto", color: "#18181b" }}>
@@ -87,18 +138,18 @@ export default function Home() {
         </div>
       </form>
 
-      {loading && <p style={{ fontSize: 13, color: "#52525b" }}>Generating, validating, and repairing if needed. Up to 3 model calls.</p>}
+      {status && <p style={{ fontSize: 13, color: "#52525b" }}>{status}</p>}
       {error && (
         <pre style={{ background: "#fee2e2", padding: 12, borderRadius: 6, fontSize: 13, whiteSpace: "pre-wrap" }}>{error}</pre>
       )}
 
-      {data?.validation && (
-        <section style={{ border: `2px solid ${data.valid ? "#16a34a" : "#dc2626"}`, borderRadius: 8, padding: 16, marginBottom: 24 }}>
+      {validation && (
+        <section style={{ border: `2px solid ${valid ? "#16a34a" : "#dc2626"}`, borderRadius: 8, padding: 16, marginBottom: 24 }}>
           <h2 style={{ fontSize: 17, margin: "0 0 8px" }}>
-            {data.valid ? "PASS" : "FAIL"} — validation ({data.totals.attempts} attempt{data.totals.attempts === 1 ? "" : "s"},{" "}
-            {Math.max(0, data.totals.attempts - 1)} repair{data.totals.attempts - 1 === 1 ? "" : "s"})
+            {valid ? "PASS" : "FAIL"} — validation ({totals.attempts} attempt{totals.attempts === 1 ? "" : "s"},{" "}
+            {Math.max(0, totals.attempts - 1)} repair{totals.attempts - 1 === 1 ? "" : "s"})
           </h2>
-          {!data.valid && (
+          {!valid && (
             <p style={{ fontSize: 13, color: "#dc2626", marginTop: 0 }}>
               Repair budget exhausted. The plan below is the last attempt and still violates the rules listed.
             </p>
@@ -106,7 +157,7 @@ export default function Home() {
 
           <table style={{ borderCollapse: "collapse", width: "100%", marginBottom: 12 }}>
             <tbody>
-              {data.validation.rules.map((r) => (
+              {validation.rules.map((r) => (
                 <tr key={r.rule}>
                   <td style={{ ...cell, width: 60, fontWeight: 600, color: r.passed ? "#16a34a" : "#dc2626" }}>
                     {r.passed ? "PASS" : "FAIL"}
@@ -136,7 +187,7 @@ export default function Home() {
               </tr>
             </thead>
             <tbody>
-              {data.attempts.map((a) => (
+              {attempts.map((a) => (
                 <tr key={a.attempt}>
                   <td style={cell}>{a.attempt}</td>
                   <td style={cell}>{a.repair ? "repair" : "generate"}</td>
@@ -154,17 +205,17 @@ export default function Home() {
               ))}
               <tr style={{ fontWeight: 600 }}>
                 <td style={cell} colSpan={4}>totals</td>
-                <td style={cell}>{data.totals.inputTokens}</td>
-                <td style={cell}>{data.totals.outputTokens}</td>
-                <td style={cell}>{(data.totals.latencyMs / 1000).toFixed(1)}s</td>
-                <td style={cell}>${data.totals.costUsd.toFixed(4)}</td>
+                <td style={cell}>{totals.inputTokens}</td>
+                <td style={cell}>{totals.outputTokens}</td>
+                <td style={cell}>{(totals.latencyMs / 1000).toFixed(1)}s</td>
+                <td style={cell}>${totals.costUsd.toFixed(4)}</td>
               </tr>
             </tbody>
           </table>
         </section>
       )}
 
-      {data?.plan && (
+      {plan && (
         <section>
           <h2 style={{ fontSize: 17 }}>Plan</h2>
           <table style={{ borderCollapse: "collapse", width: "100%" }}>
@@ -178,7 +229,7 @@ export default function Home() {
               </tr>
             </thead>
             <tbody>
-              {data.plan.weeks.map((w) => {
+              {plan.weeks.map((w) => {
                 const volume = w.days.reduce((s, d) => s + d.distanceKm, 0);
                 return (
                   <tr key={w.week}>

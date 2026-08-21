@@ -4,30 +4,44 @@ import type { MessageParam } from "@anthropic-ai/sdk/resources/messages";
 import { MODEL, costUsd } from "@/lib/anthropic";
 import { parsePlan } from "@/lib/parse";
 import { SYSTEM_PROMPT, repairPrompt, shapeRepairPrompt, userPrompt } from "@/lib/prompt";
-import type { AttemptLog, Plan, PlanRequest, PlanResponse, ValidationReport } from "@/lib/types";
+import type { AttemptResponse, PlanRequest, Violation } from "@/lib/types";
 import { validatePlan } from "@/lib/validate";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
-const MAX_REPAIRS = 2; // 1 generate + up to 2 repairs = 3 model calls, hard ceiling
+// One model call per request. The generate -> validate -> repair loop is driven by
+// the client because Netlify caps a function at ~26s and three sequential
+// generations do not fit inside one request. The bound is enforced on both sides.
+export const MAX_ATTEMPTS = 3;
 
-function parseRequest(body: unknown): { req: PlanRequest | null; error: string | null } {
-  const b = body as Partial<PlanRequest>;
+interface AttemptBody extends PlanRequest {
+  attempt?: number;
+  previousRaw?: string;
+  violations?: Violation[];
+  parseError?: string;
+}
+
+function parseRequest(body: unknown): { req: AttemptBody | null; error: string | null } {
+  const b = body as Partial<AttemptBody>;
   const weeks = Number(b?.weeks);
   const currentWeeklyKm = Number(b?.currentWeeklyKm);
   const daysAvailable = Number(b?.daysAvailable);
+  const attempt = Number(b?.attempt ?? 1);
 
   if (!b?.goal || typeof b.goal !== "string") return { req: null, error: "goal is required" };
-  if (!Number.isFinite(weeks) || weeks < 2 || weeks > 24) {
-    return { req: null, error: "weeks must be a number between 2 and 24" };
+  if (!Number.isFinite(weeks) || weeks < 2 || weeks > 16) {
+    return { req: null, error: "weeks must be a number between 2 and 16" };
   }
   if (!Number.isFinite(currentWeeklyKm) || currentWeeklyKm < 0) {
     return { req: null, error: "currentWeeklyKm must be a non-negative number" };
   }
   if (!Number.isFinite(daysAvailable) || daysAvailable < 1 || daysAvailable > 7) {
     return { req: null, error: "daysAvailable must be between 1 and 7" };
+  }
+  if (!Number.isFinite(attempt) || attempt < 1 || attempt > MAX_ATTEMPTS) {
+    return { req: null, error: `attempt must be between 1 and ${MAX_ATTEMPTS}` };
   }
 
   return {
@@ -37,6 +51,10 @@ function parseRequest(body: unknown): { req: PlanRequest | null; error: string |
       currentWeeklyKm,
       daysAvailable,
       experience: typeof b.experience === "string" && b.experience ? b.experience : "unspecified",
+      attempt,
+      previousRaw: typeof b.previousRaw === "string" ? b.previousRaw : undefined,
+      violations: Array.isArray(b.violations) ? b.violations : undefined,
+      parseError: typeof b.parseError === "string" ? b.parseError : undefined,
     },
     error: null,
   };
@@ -60,96 +78,73 @@ export async function POST(request: Request) {
     return Response.json({ ok: false, error: reqError }, { status: 400 });
   }
 
-  const client = new Anthropic({ apiKey });
+  const attempt = req.attempt ?? 1;
   const messages: MessageParam[] = [{ role: "user", content: userPrompt(req) }];
-  const attempts: AttemptLog[] = [];
 
-  let plan: Plan | null = null;
-  let validation: ValidationReport | null = null;
+  if (attempt > 1 && req.previousRaw) {
+    messages.push({ role: "assistant", content: req.previousRaw });
+    messages.push({
+      role: "user",
+      content: req.violations?.length
+        ? repairPrompt(req.violations)
+        : shapeRepairPrompt(req.parseError ?? "unparseable response"),
+    });
+  }
 
-  for (let attempt = 1; attempt <= MAX_REPAIRS + 1; attempt++) {
-    const startedAt = Date.now();
-    let message;
-    try {
-      message = await client.messages.create({
-        model: MODEL,
-        max_tokens: 8000,
-        system: SYSTEM_PROMPT,
-        messages,
-      });
-    } catch (err) {
-      const detail =
-        err instanceof Anthropic.APIError
-          ? `${err.status ?? "api"}: ${err.name}`
-          : err instanceof Error
-            ? err.name
-            : "unknown error";
-      const payload: PlanResponse = {
-        ok: false,
-        valid: false,
-        plan,
-        validation,
-        attempts,
-        totals: totalsOf(attempts),
-        error: `model call failed on attempt ${attempt} (${detail})`,
-      };
-      return Response.json(payload, { status: 502 });
-    }
+  const startedAt = Date.now();
+  let message;
+  try {
+    message = await client(apiKey).messages.create({
+      model: MODEL,
+      max_tokens: 8000,
+      system: SYSTEM_PROMPT,
+      messages,
+    });
+  } catch (err) {
+    const detail =
+      err instanceof Anthropic.APIError
+        ? `${err.status ?? "api"}: ${err.name}`
+        : err instanceof Error
+          ? err.name
+          : "unknown error";
+    return Response.json(
+      { ok: false, error: `model call failed on attempt ${attempt} (${detail})` },
+      { status: 502 },
+    );
+  }
 
-    const latencyMs = Date.now() - startedAt;
-    const text = message.content
-      .filter((block) => block.type === "text")
-      .map((block) => block.text)
-      .join("");
+  const latencyMs = Date.now() - startedAt;
+  const raw = message.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("");
 
-    const { plan: parsed, error: parseError } = parsePlan(text);
+  const { plan, error: parseError } = parsePlan(raw);
+  const validation = plan ? validatePlan(plan, req) : null;
 
-    if (parsed) {
-      plan = parsed;
-      validation = validatePlan(parsed, req);
-    }
-
-    attempts.push({
+  const payload: AttemptResponse = {
+    ok: true,
+    valid: Boolean(validation?.valid),
+    plan,
+    validation,
+    raw,
+    attempt: {
       attempt,
       repair: attempt > 1,
-      valid: Boolean(parsed) && Boolean(validation?.valid),
-      failedRules: validation && parsed ? validation.rules.filter((r) => !r.passed).map((r) => r.rule) : [],
-      violationCount: parsed && validation ? validation.violations.length : 0,
+      valid: Boolean(validation?.valid),
+      failedRules: validation ? validation.rules.filter((r) => !r.passed).map((r) => r.rule) : [],
+      violationCount: validation ? validation.violations.length : 0,
       inputTokens: message.usage.input_tokens,
       outputTokens: message.usage.output_tokens,
       latencyMs,
       costUsd: costUsd(message.usage.input_tokens, message.usage.output_tokens),
       parseError,
-    });
-
-    if (parsed && validation?.valid) break;
-    if (attempt === MAX_REPAIRS + 1) break; // out of retries — return the last attempt flagged invalid
-
-    messages.push({ role: "assistant", content: text });
-    messages.push({
-      role: "user",
-      content: parsed && validation ? repairPrompt(validation.violations) : shapeRepairPrompt(parseError ?? "unknown"),
-    });
-  }
-
-  const payload: PlanResponse = {
-    ok: true,
-    valid: Boolean(validation?.valid),
-    plan,
-    validation,
-    attempts,
-    totals: totalsOf(attempts),
+    },
   };
 
   return Response.json(payload);
 }
 
-function totalsOf(attempts: AttemptLog[]) {
-  return {
-    attempts: attempts.length,
-    inputTokens: attempts.reduce((s, a) => s + a.inputTokens, 0),
-    outputTokens: attempts.reduce((s, a) => s + a.outputTokens, 0),
-    latencyMs: attempts.reduce((s, a) => s + a.latencyMs, 0),
-    costUsd: Math.round(attempts.reduce((s, a) => s + a.costUsd, 0) * 1_000_000) / 1_000_000,
-  };
+function client(apiKey: string) {
+  return new Anthropic({ apiKey });
 }

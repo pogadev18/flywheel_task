@@ -73,6 +73,17 @@ export interface AttemptLog {
   parseError: string | null;
 }
 
+export interface AttemptResponse {
+  ok: boolean;
+  valid: boolean;
+  plan: Plan | null;
+  validation: ValidationReport | null;
+  attempt: AttemptLog;
+  /** The model's raw reply, sent back on the next request so the repair keeps context. */
+  raw: string;
+  error?: string;
+}
+
 export interface PlanResponse {
   ok: boolean;
   valid: boolean;

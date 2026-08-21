@@ -1,36 +1,23 @@
 import type { PlanRequest, Violation } from "./types";
 
-// The JSON schema is stated in the prompt (not enforced server-side) so that
-// a shape miss is a normal, observable failure the repair loop can fix.
-export const PLAN_SCHEMA = `{
-  "weeks": [
-    {
-      "week": 1,
-      "days": [
-        {
-          "day": 1,
-          "type": "easy" | "long" | "intervals" | "rest" | "strength",
-          "distanceKm": 8.0,
-          "notes": "short coaching cue, max 12 words"
-        }
-      ]
-    }
-  ]
-}`;
+// Compact wire format. The model emits positional arrays, not the full object
+// shape, because Netlify's function ceiling is ~26s and verbose JSON for a
+// multi-week plan costs enough output tokens to blow through it. The server
+// expands this back into the documented {weeks[].days[]} shape.
+export const PLAN_SCHEMA = `{"w":[[["type",distanceKm,"notes"], ...7 days...], ...N weeks...]}`;
 
 export const SYSTEM_PROMPT = `You write training plans for endurance athletes and gym-goers who train WITHOUT a coach.
 
-Reply with ONE JSON object and nothing else. No prose, no markdown fences.
+Reply with ONE minified JSON object and nothing else. No prose, no markdown fences, no whitespace.
 
-Schema:
+Format:
 ${PLAN_SCHEMA}
 
-Shape requirements:
-- "weeks" has exactly the requested number of weeks, numbered 1..N.
-- Every week has exactly 7 days, numbered 1..7.
-- "type" is one of: easy, long, intervals, rest, strength.
-- "distanceKm" is a number. Use 0 for rest and for strength sessions.
-- "notes" is a short string, never empty.
+- "w" is an array of weeks, in order. Each week is an array of exactly 7 days, in order.
+- Each day is a 3-element array: [type, distanceKm, notes].
+- type is one of: "easy", "long", "intervals", "rest", "strength".
+- distanceKm is a number. Use 0 for rest and strength.
+- notes is a coaching cue of AT MOST 6 words. Never empty.
 
 The plan is checked by a deterministic validator. It must satisfy ALL of:
 1. Weekly volume never increases more than 10% over the previous week.
@@ -38,7 +25,9 @@ The plan is checked by a deterministic validator. It must satisfy ALL of:
 3. Never two hard days in a row (hard = intervals or long), including across a week boundary.
 4. No single session exceeds 35% of that week's total volume.
 5. Every week has at least 1 rest day, and no more training days than the athlete has available.
-6. The final week tapers: its volume is lower than the week before it.`;
+6. The final week tapers: its volume is lower than the week before it.
+
+Rules 4 and 6 interact: as the taper drops weekly volume, the long run must shrink with it.`;
 
 export function userPrompt(req: PlanRequest): string {
   return `Athlete:
@@ -48,19 +37,19 @@ export function userPrompt(req: PlanRequest): string {
 - Days available per week: ${req.daysAvailable}
 - Experience: ${req.experience}
 
-Week 1 volume should be close to the athlete's current weekly volume. Return the JSON object.`;
+Week 1 volume should be close to the athlete's current weekly volume. Return exactly ${req.weeks} weeks of 7 days.`;
 }
 
 export function repairPrompt(violations: Violation[]): string {
   return `The deterministic validator rejected that plan. Violations:
 
-${JSON.stringify(violations, null, 2)}
+${JSON.stringify(violations)}
 
-Fix every violation and return the COMPLETE corrected plan as one JSON object, same schema, same number of weeks. Do not explain. Changing one week's volume shifts the ramp for the weeks after it — re-check the whole plan before answering.`;
+Fix every violation and return the COMPLETE corrected plan in the same minified format, same number of weeks. Do not explain. Changing one week's volume shifts the constraints for every week after it — re-check the whole plan before answering.`;
 }
 
 export function shapeRepairPrompt(error: string): string {
-  return `That response could not be parsed as a valid plan: ${error}
+  return `That response could not be parsed: ${error}
 
-Return one JSON object matching the schema exactly. No markdown fences, no prose.`;
+Return one minified JSON object in the documented format. No fences, no prose.`;
 }
