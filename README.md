@@ -1,36 +1,53 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# aitrainingplan.app — generate → validate → repair
 
-## Getting Started
+**Live app: https://flywheel-task.netlify.app**
 
-First, run the development server:
+A two-step pipeline that writes training plans for endurance athletes and gym-goers who
+train without a coach, then checks the plan with deterministic code instead of trusting the
+model.
+
+## How it works
+
+1. **Generate** — `POST /api/plan` calls `claude-sonnet-4-6` and asks for a structured plan:
+   `weeks[] -> days[] -> {type, distanceKm, notes}`.
+2. **Validate** — [`lib/validate.ts`](lib/validate.ts) runs six deterministic rules. **No LLM
+   call.** Each failure is structured — `{rule, week, day, detail}` — not a string.
+3. **Repair** — failures are fed back to the model verbatim and the plan is regenerated.
+   Bounded at 1 generate + 2 repairs; an exhausted budget returns the last attempt flagged
+   invalid with its outstanding violations shown.
+
+## The rules
+
+| Rule | Fails when |
+|---|---|
+| `volume_ramp` | Weekly volume increases more than 10% over the previous week |
+| `deload_cadence` | 4+ consecutive weeks with no deload (a week ≥25% below the one before it) |
+| `back_to_back_hard` | Two hard days (`intervals` or `long`) in a row, including across a week boundary |
+| `long_session_share` | Any single session exceeds 35% of that week's volume |
+| `weekly_day_budget` | Fewer than 1 rest day per week, or more training days than the athlete has available |
+| `final_week_taper` | The final week does not drop in volume vs the previous week |
+
+## Observability
+
+Every attempt is logged with its attempt number, which rules failed, input/output tokens,
+latency and cost. The log ships in the API response and is rendered under the validation
+panel in the UI.
+
+## Notes
+
+- The repair loop runs in the browser, one model call per request — Netlify kills a
+  synchronous function at ~26s and three sequential generations do not fit in one request.
+  The 3-attempt ceiling is enforced on both the client and the route. The API key never
+  leaves the server.
+- [`FAILURES.md`](FAILURES.md) is a running log of what broke during the build, what I
+  assumed it was, and what it actually was.
+
+## Local development
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
-
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
-
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+`ANTHROPIC_API_KEY` must be set in the environment for `/api/plan` to work. It is never
+committed — in production it lives in Netlify's environment variables.
